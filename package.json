@@ -50,7 +50,7 @@
     "@deepseek-ai/dsh-tools": "^0.0.1-rc.1 || ^0.2.1-rc.5"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.6.6",
     "@types/qrcode": "^1.5.5",
     "@types/ws": "^8.5.0",
     "esbuild": "^0.25.0",
