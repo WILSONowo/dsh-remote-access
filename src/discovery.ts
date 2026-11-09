@@ -1,7 +1,7 @@
 import Bonjour from 'bonjour-service';
 import { networkInterfaces } from 'node:os';
 
-export type DiscoveryAdvertisement = { session: string; name: string; port: number; tls: boolean };
+export type DiscoveryAdvertisement = { session: string; name: string; port: number; tls: boolean; pin?: string };
 export type DiscoveryPublisher = (value: DiscoveryAdvertisement, failed: () => void) => () => void;
 
 /** Open sockets only during an explicitly started pairing window. No credentials in TXT. */
@@ -14,7 +14,8 @@ export const publishDiscovery: DiscoveryPublisher = (value, failed) => {
   try { service = bonjour.publish({
     name: 'DSH-' + value.session, type: 'dsh-pair', protocol: 'tcp', port: value.port,
     host: 'dsh-' + value.session + '.local',
-    txt: { v: '1', session: value.session, name: value.name, tls: value.tls ? '1' : '0', ipv4 },
+    // pin is public (a key hash) and only seeds trust-on-first-use; the code is never advertised.
+    txt: { v: '1', session: value.session, name: value.name, tls: value.tls ? '1' : '0', ipv4, ...(value.pin ? { pin: value.pin } : {}) },
   }); } catch (error) { bonjour.destroy(); throw error; }
   service.on('error', () => { if (!closed) failed(); });
   return () => {

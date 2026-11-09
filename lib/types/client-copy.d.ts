@@ -24,6 +24,7 @@ export declare const en: {
     codeDirectChoice: string;
     discoveryInstructions: string;
     discoveryMarker: string;
+    safetyCode: string;
     discoveryActive: string;
     discoveryFailed: string;
     discoveryEnded: string;

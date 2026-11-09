@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { createSecurity, RELAY_REQUEST } from '../lib/security.js';
+import { createSecurity, RELAY_REQUEST, SECURE_CHANNEL } from '../lib/security.js';
 
 // No multicast sockets: only synthetic advertisements and in-memory HTTP requests.
 function fixture(t) {
@@ -22,7 +22,7 @@ function fixture(t) {
   async function call(path, body, remote = false, relay = false) {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
     Object.assign(req, { method: body === undefined ? 'GET' : 'POST', url: '/api/remote-access/' + path,
-      socket: { remoteAddress: remote ? '192.0.2.2' : '127.0.0.1', localPort: 7941 }, [RELAY_REQUEST]: relay,
+      socket: { remoteAddress: remote ? '192.0.2.2' : '127.0.0.1', localPort: 7941 }, [RELAY_REQUEST]: relay, [SECURE_CHANNEL]: remote || relay,
       headers: { host: remote ? '192.0.2.1:7941' : 'localhost:7941', 'content-type': 'application/json' } });
     let status, value;
     await routes.get(req.url.split('?')[0]).handler(req, { writeHead(v) { status = v; }, end(v) { value = JSON.parse(v); } });

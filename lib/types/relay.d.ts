@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { type SecureMaterial } from './secure-channel.js';
 type Config = {
     enabled: boolean;
     serverUrl: string;
@@ -9,12 +10,15 @@ type Config = {
     allowInsecureLoopback: boolean;
 };
 export declare function validateRelayConfig(input: any, previous?: Config, persisted?: boolean): Config;
-/** A private gateway dispatches only /api routes and always marks requests as remote. */
-export declare function createGateway(webServer: any): {
+/**
+ * A private, never-listening gateway behind the pinned TLS terminator. It dispatches only /api routes and
+ * marks every request as secure-channel (and relay, when it came through the server).
+ */
+export declare function createGateway(webServer: any, relay?: boolean): {
     gateway: http.Server<typeof http.IncomingMessage, typeof http.ServerResponse>;
     close(): Promise<void>;
 };
-export declare function createRelayManager(home: string, webServer: any, register: (route: any) => void, generatePairTicket?: () => {
+export declare function createRelayManager(home: string, webServer: any, register: (route: any) => void, material: SecureMaterial, generatePairTicket?: () => {
     ticket: string;
     expiresAt: number;
 }, isAllowed?: () => boolean): {

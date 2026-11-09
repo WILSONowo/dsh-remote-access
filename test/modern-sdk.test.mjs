@@ -1,4 +1,5 @@
 import { decodePairingTestLink } from './pairing-fixture.mjs';
+import { secureRequest } from './secure-client.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -10,7 +11,7 @@ import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 import { createModernAdapter, assistantBaseline } from '../lib/modern.js';
-import { createSecurity, RELAY_REQUEST } from '../lib/security.js';
+import { createSecurity, RELAY_REQUEST, SECURE_CHANNEL } from '../lib/security.js';
 import * as plugin from '../lib/index.js';
 import { listenLoopback } from './loopback.mjs';
 
@@ -84,7 +85,7 @@ test('0.2.1-rc.5 real Gateway + generated schemas: mobile RPC, history, WS, inte
   const bridge = createModernAdapter({ typertGateway: ctx.typertGateway, connection, webServer: { prefixes: new Map() } }, register);
   t.after(async () => { security.dispose(); await bridge.dispose(); });
   const server = createServer((req, res) => {
-    if (!req.url.startsWith('/local/')) req[RELAY_REQUEST] = true;
+    if (!req.url.startsWith('/local/')) { req[RELAY_REQUEST] = true; req[SECURE_CHANNEL] = true; }
     else req.url = req.url.slice(6);
     if (!security.authorize(req)) { res.writeHead(401); res.end(); return; }
     security.track(req, res);
@@ -93,7 +94,7 @@ test('0.2.1-rc.5 real Gateway + generated schemas: mobile RPC, history, WS, inte
     void route.handler(req, res);
   });
   server.on('upgrade', (req, socket, head) => {
-    req[RELAY_REQUEST] = true;
+    req[RELAY_REQUEST] = true; req[SECURE_CHANNEL] = true;
     if (!security.authorize(req)) { socket.destroy(); return; }
     security.track(req, socket); upgrades.get(req.url)?.handler(req, socket, head);
   });
@@ -224,8 +225,10 @@ test('0.2.1-rc.5 actual WebServer/Connection: plugin mounting, native auth, rela
   assert.equal(await (await get('/api/session/list', 'fixture=browser')).text(), 'native browser');
   assert.equal(await (await get('/api/commands/list', 'fixture=browser')).text(), 'native browser');
   assert.equal((await get('/api/remote-access/pair/code/current', 'fixture=browser')).status, 401);
-  const describe = await fetch(base + '/api/host.describe', { method: 'POST', headers: { 'Content-Type': 'application/json', Host: 'phone.test' }, body: JSON.stringify({ type: 'client-request', rpcId: 'describe', method: 'host.describe' }) });
-  const description = (await describe.json()).result.value;
+  // Phones reach the host only through the pinned TLS channel on the host port.
+  const direct = base.replace(/^http/, 'ws') + '/api/remote-access/secure';
+  const describe = await secureRequest(direct, '/api/host.describe', { method: 'POST', body: { type: 'client-request', rpcId: 'describe', method: 'host.describe' } });
+  const description = describe.body.result.value;
   assert.equal(description.hostProtocol, 'typert');
   assert.equal(description.version, expectedVersion);
   const { createRelayServer } = await import(pathToFileURL(join(backend, 'src/server.mjs')).href);
@@ -241,19 +244,23 @@ test('0.2.1-rc.5 actual WebServer/Connection: plugin mounting, native auth, rela
   for (let i = 0; i < 100 && !relay.online.size; i++) await new Promise(r => setTimeout(r, 10));
   assert.equal(relay.online.size, 1);
   const hostId = [...relay.online.keys()][0];
-  const forwarded = await post(relayUrl + '/h/' + hostId + '/api/host.describe', { type: 'client-request', rpcId: 'version', method: 'host.describe' });
+  const viaRelay = relayUrl.replace(/^http/, 'ws') + '/relay/v2/connect/' + hostId;
+  const phone = (path, body, token, extra = {}) => secureRequest(viaRelay, path, { method: 'POST', body, pin: describe.pin,
+    headers: { ...(token ? { Authorization: 'Bearer ' + token } : {}), ...extra } });
+  const forwarded = await phone('/api/host.describe', { type: 'client-request', rpcId: 'version', method: 'host.describe' });
   assert.equal(forwarded.body.result.value.version, expectedVersion);
   const qr = (await post(base + '/api/remote-access/relay/pairing', {})).body;
   const ticket = decodePairingTestLink(qr.link).ticket;
   const proof = { 'X-DSH-Pairing-Secret': randomBytes(32).toString('hex') };
-  assert.equal((await post(relayUrl + '/h/' + hostId + '/api/remote-access/pair/request', { deviceId: 'sdk-phone', ticket }, undefined, proof)).body.state, 'pending');
+  assert.equal(decodePairingTestLink(qr.link).pin, describe.pin, 'QR pin matches the key the host presents');
+  assert.equal((await phone('/api/remote-access/pair/request', { deviceId: 'sdk-phone', ticket }, undefined, proof)).body.state, 'pending');
   await post(base + '/api/remote-access/pair/respond', { deviceId: 'sdk-phone', outcome: 'approve' });
-  const token = (await post(relayUrl + '/h/' + hostId + '/api/remote-access/pair/claim', { deviceId: 'sdk-phone' }, undefined, proof)).body.token;
+  const token = (await phone('/api/remote-access/pair/claim', { deviceId: 'sdk-phone' }, undefined, proof)).body.token;
   assert.match(token, /^[a-f0-9]{64}$/);
-  const result = await post(relayUrl + '/h/' + hostId + '/api/session.list', { type: 'client-request', rpcId: 'via-relay', method: 'session.list', payload: {} }, token);
+  const result = await phone('/api/session.list', { type: 'client-request', rpcId: 'via-relay', method: 'session.list', payload: {} }, token);
   assert.equal(result.body.result.ok, true, JSON.stringify(result));
   assert.equal(result.body.result.value.items[0].sessionId, 'relay-sdk');
-  assert.equal((await post(relayUrl + '/h/' + hostId + '/api/remote-access/pair/code/generate', {}, token)).status, 401);
+  assert.equal((await phone('/api/remote-access/pair/code/generate', {}, token)).status, 401);
   await post(base + '/api/remote-access/access/settings', { allowConnections: false });
   assert.equal((await get('/api/session/list', 'fixture=browser')).status, 503, 'native auth must not bypass disabled remote access');
   assert.equal((await get('/assets/test.js')).status, 200);

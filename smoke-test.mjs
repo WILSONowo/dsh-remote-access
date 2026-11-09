@@ -26,6 +26,7 @@ syntheticExec[promisify.custom] = async () => ({ stdout: "Synthetic Model", stde
 childProcess.execFile = syntheticExec;
 syncBuiltinESMExports();
 const { apply } = await import("./lib/index.js");
+const { secureRequest } = await import("./test/secure-client.mjs");
 
 const home = mkdtempSync(join(tmpdir(), "dsh-ra-smoke-"));
 process.env.DSH_HOME = home;
@@ -37,7 +38,7 @@ function makeWebServer() {
     prefixes: new Map(),
     upgrades: new Map(),
     register(route) {
-      const table = route.kind === "exact" ? server.exact : server.prefixes;
+      const table = route.kind === "exact" ? server.exact : route.kind === "upgrade" ? server.upgrades : server.prefixes;
       table.set(route.path, route);
       return () => table.delete(route.path);
     },
@@ -68,6 +69,10 @@ const srv = http.createServer((req, res) => {
   }
   route.handler(req, res);
 });
+srv.on("upgrade", (req, socket, head) => {
+  const route = ctx.webServer.upgrades.get(new URL(req.url, "http://x").pathname);
+  if (route) route.handler(req, socket, head); else socket.destroy();
+});
 
 let listening = null;
 function listen() {
@@ -76,9 +81,14 @@ function listen() {
   }
   return listening;
 }
+// Phone-originated requests (marked by a forwarded address) travel through the real pinned TLS channel;
+// opts.plain forces the legacy plaintext path to prove it is refused.
 async function req(path, opts = {}) {
   await listen(); // 幂等：并发测试下等待服务器就绪
   const port = srv.address().port;
+  if (!opts.plain && opts.headers && "x-forwarded-for" in opts.headers) {
+    return secureRequest(`ws://127.0.0.1:${port}/api/remote-access/secure`, path, { method: opts.method || "GET", headers: opts.headers, body: opts.body });
+  }
   return new Promise((resolve, reject) => {
     const r = http.request({ host: "127.0.0.1", port, path, method: opts.method || "GET", headers: opts.headers || {} }, (res) => {
       let body = "";
@@ -707,4 +717,20 @@ test("M2 离线同步：sync/pending 拉取 + ACK 清除", async () => {
 test.after(() => {
   srv.close();
   rmSync(home, { recursive: true, force: true });
+});
+
+test("明文远程请求被拒绝：令牌只在安全通道内有效，旧 App 收到 426", async () => {
+  const token = await pair("plain-phone");
+  const plain = { "x-forwarded-for": "198.51.100.9", authorization: "Bearer " + token };
+  assert.equal((await req("/api/protected-test", { headers: plain })).status, 200);
+  assert.equal((await req("/api/protected-test", { headers: plain, plain: true })).status, 401);
+  const old = await req("/api/remote-access/pair/check?deviceId=plain-phone", { headers: plain, plain: true });
+  assert.equal(old.status, 426); assert.equal(old.body.error, "secure_channel_required");
+  const code = await post("/api/remote-access/pair/code/generate", {});
+  assert.match(code.body.safetyCode, /^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/);
+  const verify = await req("/api/remote-access/pair/code/verify", { method: "POST", plain: true, headers: { "Content-Type": "application/json", "x-forwarded-for": "198.51.100.9" }, body: { code: code.body.code, deviceId: "plain-2" } });
+  assert.equal(verify.status, 426); assert.equal(verify.body.token, undefined);
+  const secure = await req("/api/remote-access/pair/check?deviceId=plain-phone", { headers: plain });
+  assert.equal(secure.body.paired, true);
+  assert.equal(secure.pin.slice(0, 12).toUpperCase(), code.body.safetyCode.replaceAll("-", ""));
 });

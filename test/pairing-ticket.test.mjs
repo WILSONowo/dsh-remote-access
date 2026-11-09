@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { createSecurity, RELAY_REQUEST } from '../lib/security.js';
+import { createSecurity, RELAY_REQUEST, SECURE_CHANNEL } from '../lib/security.js';
 import { computerIdentity } from '../lib/identity.js';
 import { createRelayManager, validateRelayConfig } from '../lib/relay.js';
 
@@ -23,7 +23,7 @@ test('scan tickets expire, are replaced and consumed once; approval and claim pr
     const req = Readable.from([Buffer.from(JSON.stringify(body))]);
     Object.assign(req, { method: 'POST', url: '/api/remote-access/' + path,
       headers: { host: 'localhost', 'content-type': 'application/json', 'x-dsh-pairing-secret': secret },
-      socket: { remoteAddress: '127.0.0.1' }, [RELAY_REQUEST]: !admin });
+      socket: { remoteAddress: '127.0.0.1' }, [RELAY_REQUEST]: !admin, [SECURE_CHANNEL]: !admin });
     let status, value;
     await routes.get(req.url).handler(req, { writeHead(code) { status = code; }, end(text) { value = JSON.parse(text); } });
     return { status, ...value };

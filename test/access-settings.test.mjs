@@ -5,19 +5,21 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { createSecurity, RELAY_REQUEST } from '../lib/security.js';
+import { createSecurity, RELAY_REQUEST, SECURE_CHANNEL } from '../lib/security.js';
+import { decodeDirectTestLink } from './pairing-fixture.mjs';
 
 const fakeWake = () => { let enabled = false; return { setEnabled(v) { enabled = v; }, status: () => ({ supported: true, state: enabled ? 'active' : 'off' }), dispose() { enabled = false; } }; };
 test('connection switch persists, invalidates pending pairing, gates remote requests and preserves credentials', async t => {
   t.mock.method(os, 'hostname', () => 'Synthetic-PC'); syncBuiltinESMExports();
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
   const home = mkdtempSync(join(tmpdir(), 'dsh-access-')), routes = new Map(), changes = [];
-  let security = createSecurity(home, r => routes.set(r.path, r), { wake: fakeWake(), onAccessChange: value => changes.push(value) });
+  const secure = { pin: 'ab'.repeat(32), safetyCode: 'ABAB-ABAB-ABAB' };
+  let security = createSecurity(home, r => routes.set(r.path, r), { wake: fakeWake(), secure, onAccessChange: value => changes.push(value) });
   t.after(() => { security.dispose(); rmSync(home, { recursive: true, force: true }); });
   async function call(path, body, admin = true, token) {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
     Object.assign(req, { method: body === undefined ? 'GET' : 'POST', url: '/api/remote-access/' + path,
-      socket: { remoteAddress: '127.0.0.1' }, [RELAY_REQUEST]: !admin,
+      socket: { remoteAddress: '127.0.0.1' }, [RELAY_REQUEST]: !admin, [SECURE_CHANNEL]: !admin,
       headers: { host: 'localhost', 'content-type': 'application/json', 'x-dsh-pairing-secret': 'a'.repeat(64), ...(token ? { authorization: 'Bearer ' + token } : {}) } });
     let status, value;
     await routes.get(req.url.split('?')[0]).handler(req, { writeHead(v) { status = v; }, end(v) { value = JSON.parse(v); } });
@@ -35,10 +37,11 @@ test('connection switch persists, invalidates pending pairing, gates remote requ
   assert.equal(resetComputer.id, originalComputer.id);
   assert.equal((await call('computer/rename', { reset: true }, false, token)).status, 401);
   const directQr = await call('direct/qr', { address: 'https://direct.example.test:8443' });
-  assert.equal(directQr.link, 'https://direct.example.test:8443');
+  assert.deepEqual(decodeDirectTestLink(directQr.link), { address: 'https://direct.example.test:8443', name: originalComputer.defaultName, pin: secure.pin });
+  assert.equal(directQr.safetyCode, secure.safetyCode);
   assert.match(directQr.image, /^data:image\/png;base64,/);
   assert.equal((await call('direct/qr', { address: 'https://direct.example.test' }, false, token)).status, 401);
-  for (const address of ['javascript:alert(1)', 'https://user:password@example.test', 'https://example.test/?token=secret']) {
+  for (const address of ['javascript:alert(1)', 'https://user:password@example.test', 'https://example.test/?token=secret', 'https://example.test/sub']) {
     assert.equal((await call('direct/qr', { address })).status, 400);
   }
   assert.equal((await call('access/settings', { allowConnections: false }, false, token)).status, 401);

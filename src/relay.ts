@@ -1,12 +1,13 @@
 import http from 'node:http';
 import https from 'node:https';
 import { randomBytes } from 'node:crypto';
-import net from 'node:net';
+import type net from 'node:net';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { Tunnel, MAX_FRAME } from './tunnel.js';
-import { RELAY_REQUEST, bodyJson, isLocalAdmin, reply } from './security.js';
+import { RELAY_REQUEST, SECURE_CHANNEL, bodyJson, isLocalAdmin, reply } from './security.js';
+import { createSecureTerminator, type SecureMaterial } from './secure-channel.js';
 import { computerIdentity } from './identity.js';
 import QRCode from 'qrcode';
 import { encodePairingLink } from './pairing-link.js';
@@ -33,15 +34,19 @@ export function validateRelayConfig(input: any, previous: Config = empty, persis
   return c;
 }
 
-/** A private gateway dispatches only /api routes and always marks requests as remote. */
-export function createGateway(webServer: any) {
+/**
+ * A private, never-listening gateway behind the pinned TLS terminator. It dispatches only /api routes and
+ * marks every request as secure-channel (and relay, when it came through the server).
+ */
+export function createGateway(webServer: any, relay = true) {
+  const mark = (req: any) => { req[SECURE_CHANNEL] = true; if (relay) req[RELAY_REQUEST] = true; };
   const match = (table: Map<string, any>, path: string, prefixes = false) => {
     if (!prefixes) return table?.get(path);
     return [...(table || [])].sort((a, b) => b[0].length - a[0].length).find(([key]) => path.startsWith(key))?.[1];
   };
   const sockets = new Set<net.Socket>();
   const gateway = http.createServer((req, res) => {
-    (req as any)[RELAY_REQUEST] = true;
+    mark(req);
     const path = new URL(req.url!, 'http://localhost').pathname;
     if (!/^\/api\//.test(path)) return reply(res, 404, { error: 'not_found' });
     const route = match(webServer.exact, path) || match(webServer.prefixes, path, true);
@@ -52,7 +57,7 @@ export function createGateway(webServer: any) {
   });
   gateway.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
   gateway.on('upgrade', (req, socket, head) => {
-    (req as any)[RELAY_REQUEST] = true;
+    mark(req);
     socket.on('error', () => {});
     const path = new URL(req.url!, 'http://localhost').pathname;
     const route = /^\/api\/events\.(mux|host)$/.test(path) && match(webServer.upgrades, path);
@@ -63,14 +68,14 @@ export function createGateway(webServer: any) {
   return { gateway, async close() { for (const s of sockets) s.destroy(); await new Promise<void>(r => gateway.close(() => r())); } };
 }
 
-export function createRelayManager(home: string, webServer: any, register: (route: any) => void, generatePairTicket?: () => { ticket: string; expiresAt: number }, isAllowed: () => boolean = () => true) {
+export function createRelayManager(home: string, webServer: any, register: (route: any) => void, material: SecureMaterial, generatePairTicket?: () => { ticket: string; expiresAt: number }, isAllowed: () => boolean = () => true) {
   const file = join(home, 'remote-access', 'relay.json');
   let config = { ...empty };
   let state = 'disabled', detail = '';
   try { if (existsSync(file)) config = validateRelayConfig(JSON.parse(readFileSync(file, 'utf8')), undefined, true); }
   catch { detail = '服务器配置已失效或属于旧版手动方案，请填写服务器地址重新启用，再让设备扫码连接'; }
   let generation = 0;
-  let local: ReturnType<typeof createGateway> | undefined;
+  let local: { close(): Promise<void> } | undefined;
   let ws: WebSocket | undefined;
   let retry: NodeJS.Timeout | undefined;
   let backoff = 1000;
@@ -135,11 +140,9 @@ export function createRelayManager(home: string, webServer: any, register: (rout
         return;
       } finally { if (generation === current) registrationRequest = undefined; }
     }
-    const instance = createGateway(webServer); local = instance;
-    try { await new Promise<void>((resolve, reject) => { instance.gateway.once('error', reject); instance.gateway.listen(0, '127.0.0.1', resolve); }); }
-    catch { state = 'error'; detail = '无法启动本地中转通道'; return; }
-    if (generation !== current) { await instance.close(); return; }
-    const port = (instance.gateway.address() as net.AddressInfo).port;
+    // Relay channels carry only the phone's TLS records; the relay never sees plaintext or credentials.
+    const instance = createGateway(webServer, true), terminator = createSecureTerminator(material, instance.gateway);
+    local = { async close() { terminator.close(); await instance.close(); } };
     const connect = () => {
       if (generation !== current) return;
       state = 'connecting'; detail = '';
@@ -150,13 +153,7 @@ export function createRelayManager(home: string, webServer: any, register: (rout
       client.on('open', () => {
         if (generation !== current) { client.terminate(); return; }
         state = 'connected'; backoff = 1000;
-        new Tunnel(client, channel => {
-          const socket = net.connect({ host: '127.0.0.1', port });
-          socket.on('error', () => channel.destroy());
-          socket.on('close', hadError => { if (hadError || !socket.readableEnded) channel.destroy(); });
-          channel.on('close', () => socket.destroy());
-          channel.pipe(socket).pipe(channel);
-        });
+        new Tunnel(client, channel => { terminator.accept(channel); });
       });
       client.on('unexpected-response', (_, response) => {
         denied = [401, 403, 409].includes(response.statusCode || 0);
@@ -197,10 +194,10 @@ export function createRelayManager(home: string, webServer: any, register: (rout
     try {
       await bodyJson(req);
       const identity = computerIdentity(home);
-      const payload = { v: 1, server: config.serverUrl, hostId: config.hostId, computerId: identity.id, name: identity.name, ...generatePairTicket() };
+      const payload = { v: 1, server: config.serverUrl, hostId: config.hostId, computerId: identity.id, name: identity.name, pin: material.pin, ...generatePairTicket() };
       const link = encodePairingLink(payload);
       const image = await QRCode.toDataURL(link, { errorCorrectionLevel: 'M', margin: 4, scale: 8 });
-      return reply(res, 200, { ok: true, link, image, expiresAt: payload.expiresAt });
+      return reply(res, 200, { ok: true, link, image, expiresAt: payload.expiresAt, safetyCode: material.safetyCode });
     } catch { return reply(res, 503, { ok: false, error: '无法生成配对二维码，请重试' }); }
   } });
   return { start, stop, setAllowed: (_enabled: boolean) => { void start(); }, status: () => ({ state, detail }) };

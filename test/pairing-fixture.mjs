@@ -1,9 +1,9 @@
 // Decode test links independently of the production encoder; no live connection information.
 export function decodePairingTestLink(link) {
   const fragment = new URL(link).hash.slice(1);
-  if (!fragment.startsWith('2.')) return JSON.parse(Buffer.from(fragment, 'base64url'));
+  if (!fragment.startsWith('3.')) throw new Error('Only compact v3 links carry the TLS pin');
   const bytes = Buffer.from(fragment.slice(2), 'base64url');
-  let offset = 72;
+  let offset = 104;
   const string = () => {
     const size = bytes.readUInt16BE(offset); offset += 2;
     const value = bytes.subarray(offset, offset + size).toString('utf8'); offset += size; return value;
@@ -11,7 +11,21 @@ export function decodePairingTestLink(link) {
   const hex = (a, b) => bytes.subarray(a, b).toString('hex');
   const result = { v: 1, server: string(), hostId: hex(8, 24),
     computerId: [hex(24, 28), hex(28, 30), hex(30, 32), hex(32, 34), hex(34, 40)].join('-'),
-    name: string(), ticket: hex(40, 72), expiresAt: Number(bytes.readBigUInt64BE(0)) };
+    name: string(), ticket: hex(40, 72), expiresAt: Number(bytes.readBigUInt64BE(0)), pin: hex(72, 104) };
   if (offset !== bytes.length) throw new Error('Trailing bytes');
   return result;
+}
+
+export function decodeDirectTestLink(link) {
+  const url = new URL(link);
+  if (url.protocol !== 'dshremote:' || url.host !== 'direct' || !url.hash.startsWith('#1.')) throw new Error('Not a direct v1 link');
+  const bytes = Buffer.from(url.hash.slice(3), 'base64url');
+  let offset = 32;
+  const string = () => {
+    const size = bytes.readUInt16BE(offset); offset += 2;
+    const value = bytes.subarray(offset, offset + size).toString('utf8'); offset += size; return value;
+  };
+  const result = { pin: bytes.subarray(0, 32).toString('hex'), address: string(), name: string() };
+  if (offset !== bytes.length) throw new Error('Trailing bytes');
+  return { address: result.address, name: result.name, pin: result.pin };
 }

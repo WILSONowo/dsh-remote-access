@@ -13,6 +13,8 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { apply } from '../lib/index.js';
 import { pathToFileURL } from 'node:url';
 import { listenLoopback } from './loopback.mjs';
+import { secureConnection, secureRequest } from './secure-client.mjs';
+import { loadSecureMaterial } from '../lib/secure-channel.js';
 const backend = process.env.DSH_RELAY_BACKEND;
 const createRelayServer = backend ? (await import(pathToFileURL(join(backend, 'src/server.mjs')).href)).createRelayServer : null;
 
@@ -67,7 +69,19 @@ async function fixture(t, secure = false) {
     tls, allowInsecureLoopback: !secure });
   await listenLoopback(relay.server);
   const url = `${secure ? 'https' : 'http'}://127.0.0.1:${relay.server.address().port}`;
+  // Phones never talk plaintext to the computer: RELAY and DIRECT route through the pinned TLS channel.
+  const RELAY = 'phone-via-relay:', DIRECT = 'phone-direct:';
+  let pin;
+  const channelUrl = base => base === RELAY ? url.replace(/^http/, 'ws') + '/relay/v2/connect/' + hostId : localUrl.replace(/^http/, 'ws') + '/api/remote-access/secure';
+  const wsOptions = base => base === RELAY && tls ? { ca: tls.cert } : {};
+  const connect = base => secureConnection(channelUrl(base), { pin, wsOptions: wsOptions(base) });
   async function json(base, path, body, auth, extra = {}) {
+    if (base === RELAY || base === DIRECT) {
+      const { 'X-Forwarded-For': _, ...headers } = extra;
+      const raw = Buffer.isBuffer(body) || typeof body === 'string';
+      return secureRequest(channelUrl(base), path, { pin, wsOptions: wsOptions(base), method: body === undefined ? 'GET' : 'POST', body,
+        headers: { ...(raw ? { 'content-type': 'application/octet-stream' } : {}), ...(auth ? { Authorization: 'Bearer ' + auth } : {}), ...headers } });
+    }
     if (base.startsWith('https:')) return new Promise((resolve, reject) => {
       const req = https.request(base + path, { ca: tls.cert, method: body === undefined ? 'GET' : 'POST',
         headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(auth ? { Authorization: 'Bearer ' + auth } : {}), ...extra } }, res => {
@@ -92,7 +106,8 @@ async function fixture(t, secure = false) {
   assert.equal((await configure()).body.ok, true);
   await until(() => relay.online.size === 1);
   const hostId = [...relay.online.keys()][0];
-  const base = url + '/h/' + hostId;
+  pin = loadSecureMaterial(home).pin;
+  const base = RELAY;
   async function pair(id) {
     const qr = await json(localUrl, '/api/remote-access/relay/pairing', {});
     const ticket = decodePairingTestLink(qr.body.link).ticket;
@@ -102,7 +117,12 @@ async function fixture(t, secure = false) {
     const result = await json(base, '/api/remote-access/pair/claim', { deviceId: id }, undefined, headers);
     assert.equal(result.body.ok, true); return result.body.token;
   }
-  return { home, relay, url, localUrl, base, hostId, json, pair, configure, tls, registrationToken: JSON.parse(readFileSync(join(home, 'remote-access', 'relay.json'))).registrationToken, executions: () => executions };
+  // Server-sent events over the secure channel; resolves with the response stream.
+  const events = (base, token) => new Promise((resolve, reject) => {
+    const req = http.get({ path: '/api/events.host', headers: { host: 'test.e2e.dsh.invalid', Authorization: 'Bearer ' + token }, createConnection: connect(base) }, res => { res.on('error', () => {}); resolve(res); });
+    req.on('error', reject);
+  });
+  return { home, relay, url, localUrl, base, direct: DIRECT, connect, events, pin, hostId, json, pair, configure, tls, registrationToken: JSON.parse(readFileSync(join(home, 'remote-access', 'relay.json'))).registrationToken, executions: () => executions };
 }
 
 test('自动注册与扫码：无服务器逐机配置，多手机独立确认、撤销、名称与身份分离', { skip: !backend && 'Set DSH_RELAY_BACKEND', timeout: 20000 }, async t => {
@@ -180,13 +200,17 @@ test('本机 HTTP 中转：配对、未授权拦截、流式上传、保留直�
   const token = await f.pair('phone-a');
   assert.equal((await f.json(f.base, '/api/remote-access/pair/check?deviceId=phone-a')).body.paired, false);
   const data = randomBytes(3 * 1024 * 1024 + 27);
-  const response = await fetch(f.base + '/api/echo', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: data });
+  const response = await f.json(f.base, '/api/echo', data, token);
   assert.equal(response.status, 200);
-  assert.deepEqual(Buffer.from(await response.arrayBuffer()), data);
-  const direct = await fetch(f.localUrl + '/api/echo', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'X-Forwarded-For': 'remote' }, body: 'direct' });
-  assert.equal(await direct.text(), 'direct');
-  assert.equal((await fetch(f.url + '/h/' + '0'.repeat(32) + '/api/echo', { headers: { Authorization: 'Bearer ' + token } })).status, 503);
-  assert.equal((await fetch(f.base + '/not-api')).status, 404);
+  assert.deepEqual(response.data, data);
+  assert.equal(response.pin, f.pin);
+  const direct = await f.json(f.direct, '/api/echo', 'direct', token);
+  assert.equal(direct.text, 'direct');
+  // Plaintext with a valid token is refused on every path a phone could use.
+  assert.equal((await f.json(f.url, '/h/' + f.hostId + '/api/echo', undefined, token)).status, 404);
+  assert.equal((await fetch(f.localUrl + '/api/echo', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'X-Forwarded-For': 'remote' }, body: 'plain' })).status, 401);
+  assert.equal((await fetch(f.localUrl + '/api/remote-access/device/info', { headers: { Authorization: 'Bearer ' + token, 'X-Forwarded-For': 'remote' } })).status, 426);
+  assert.equal((await f.json(f.base, '/not-api')).status, 404);
   assert.equal(f.executions(), 2);
 });
 
@@ -195,7 +219,7 @@ test('HTTPS/WSS：CA 验证、主机注册鉴权、重复注册与设备配对',
   await assert.rejects(new Promise((resolve, reject) => {
     https.get(f.url + '/healthz', resolve).on('error', reject);
   }), /certificate|self.signed/i);
-  assert.equal((await f.json(f.url, '/healthz')).body.protocol, 1);
+  assert.equal((await f.json(f.url, '/healthz')).body.protocol, 2);
   const rejection = token => new Promise((resolve, reject) => {
     const ws = new WebSocket(f.url.replace('https:', 'wss:') + '/relay/v1/agent/' + f.hostId, { ca: f.tls.cert, headers: { Authorization: 'Bearer ' + token } });
     ws.on('unexpected-response', (_, res) => { res.resume(); resolve(res.statusCode); ws.terminate(); });
@@ -221,53 +245,50 @@ test('HTTPS/WSS：CA 验证、主机注册鉴权、重复注册与设备配对',
 test('真实 WebSocket 和 SSE：按设备撤销立即关闭流，其他设备继续连接', { skip: !backend && 'Set DSH_RELAY_BACKEND to an isolated backend checkout', timeout: 20000 }, async t => {
   const f = await fixture(t), a = await f.pair('stream-a'), b = await f.pair('stream-b');
   const open = async token => {
-    const ws = new WebSocket(f.base.replace('http:', 'ws:') + '/api/events.mux', { headers: { Authorization: 'Bearer ' + token } });
+    const ws = new WebSocket('ws://test.e2e.dsh.invalid/api/events.mux', { headers: { Authorization: 'Bearer ' + token }, createConnection: f.connect(f.base) });
     await once(ws, 'open'); return ws;
   };
   const wa = await open(a), wb = await open(b);
   t.after(() => { wa.terminate(); wb.terminate(); });
   const msg = once(wa, 'message'); wa.send('event'); assert.equal((await msg)[0].toString(), 'event');
-  const controller = new AbortController(); t.after(() => controller.abort());
-  const sse = await fetch(f.base + '/api/events.host', { headers: { Authorization: 'Bearer ' + a }, signal: controller.signal });
-  const reader = sse.body.getReader(); assert.match(new TextDecoder().decode((await reader.read()).value), /data: first/);
-  const closed = once(wa, 'close');
+  const sse = await f.events(f.base, a); t.after(() => sse.destroy());
+  assert.match((await once(sse, 'data'))[0].toString(), /data: first/);
+  const closed = once(wa, 'close'), sseClosed = new Promise(r => sse.once('close', r));
   await f.json(f.localUrl, '/api/remote-access/pair/revoke', { deviceId: 'stream-a' });
-  await closed;
-  await assert.rejects(async () => { while (!(await reader.read()).done) {} throw new Error('stream ended'); });
+  await closed; await sseClosed;
+  assert.equal(sse.complete, false, 'revoked event stream is cut, not completed');
   const still = once(wb, 'message'); wb.send('still-connected'); assert.equal((await still)[0].toString(), 'still-connected');
   assert.equal((await f.json(f.base, '/api/remote-access/device/info', undefined, a)).status, 401);
 });
 
 test('中转断线会关闭活动请求，重连不重放写操作；禁用中转后直连保留', { skip: !backend && 'Set DSH_RELAY_BACKEND to an isolated backend checkout', timeout: 20000 }, async t => {
   const f = await fixture(t), token = await f.pair('reconnect-phone');
-  const headers = { Authorization: 'Bearer ' + token };
-  assert.equal(await (await fetch(f.base + '/api/echo', { method: 'POST', headers, body: 'once' })).text(), 'once');
+  assert.equal((await f.json(f.base, '/api/echo', 'once', token)).text, 'once');
   f.relay.online.get(f.hostId).ws.terminate();
   await until(() => !f.relay.online.has(f.hostId));
-  assert.equal((await fetch(f.base + '/api/echo', { method: 'POST', headers, body: 'offline' })).status, 503);
+  assert.equal((await f.json(f.base, '/api/echo', 'offline', token)).status, 503);
   await until(() => f.relay.online.has(f.hostId), 8000);
   assert.equal(f.executions(), 1);
-  assert.equal(await (await fetch(f.base + '/api/echo', { method: 'POST', headers, body: 'new' })).text(), 'new');
+  assert.equal((await f.json(f.base, '/api/echo', 'new', token)).text, 'new');
   await f.configure(false); await until(() => !f.relay.online.has(f.hostId));
-  assert.equal((await fetch(f.base + '/api/echo')).status, 503);
-  assert.equal(await (await fetch(f.localUrl + '/api/echo', { method: 'POST', headers: { ...headers, 'X-Forwarded-For': 'remote' }, body: 'direct' })).text(), 'direct');
+  assert.equal((await f.json(f.base, '/api/echo', undefined, token)).status, 503);
+  assert.equal((await f.json(f.direct, '/api/echo', 'direct', token)).text, 'direct');
 });
 
 
 test('global switch disconnects direct and server streams, stops registration, and reuses existing pairings', { skip: !backend && 'Set DSH_RELAY_BACKEND', timeout: 20000 }, async t => {
   const f = await fixture(t), token = await f.pair('switch-phone');
-  const headers = { Authorization: 'Bearer ' + token, 'X-Forwarded-For': 'synthetic-remote' };
-  const ws = new WebSocket(f.localUrl.replace('http:', 'ws:') + '/api/events.mux', { headers });
+  const ws = new WebSocket('ws://test.e2e.dsh.invalid/api/events.mux', { headers: { Authorization: 'Bearer ' + token }, createConnection: f.connect(f.direct) });
   await once(ws, 'open'); t.after(() => ws.terminate());
-  const controller = new AbortController(); t.after(() => controller.abort());
-  const sse = await fetch(f.base + '/api/events.host', { headers: { Authorization: 'Bearer ' + token }, signal: controller.signal });
-  const reader = sse.body.getReader(); await reader.read();
-  const wsClosed = once(ws, 'close');
+  const sse = await f.events(f.base, token); t.after(() => sse.destroy());
+  await once(sse, 'data');
+  const wsClosed = once(ws, 'close'), sseClosed = new Promise(r => sse.once('close', r));
   assert.equal((await f.json(f.localUrl, '/api/remote-access/access/settings', { allowConnections: false })).body.allowConnections, false);
   await wsClosed; await until(() => f.relay.online.size === 0);
-  await assert.rejects(async () => { while (!(await reader.read()).done) {} throw new Error('ended'); });
-  assert.equal((await f.json(f.localUrl, '/api/remote-access/device/info', undefined, token, { 'X-Forwarded-For': 'synthetic-remote' })).status, 503);
-  assert.equal((await f.json(f.localUrl, '/api/remote-access/pair/request', { deviceId: 'blocked' }, undefined, { 'X-Forwarded-For': 'synthetic-remote' })).status, 503);
+  await sseClosed;
+  // The secure entry itself is closed while connections are paused.
+  assert.equal((await f.json(f.direct, '/api/remote-access/device/info', undefined, token)).status, 503);
+  assert.equal((await f.json(f.direct, '/api/remote-access/pair/request', { deviceId: 'blocked' })).status, 503);
   assert.equal((await f.json(f.localUrl, '/api/remote-access/relay/pairing', {})).status, 409);
   const before = (await f.json(f.localUrl, '/api/remote-access/pair/list')).body.devices;
   assert.equal(before.length, 1); assert.ok(before[0].lastConnectedAt);
@@ -276,5 +297,5 @@ test('global switch disconnects direct and server streams, stops registration, a
   await f.json(f.localUrl, '/api/remote-access/access/settings', { allowConnections: true });
   await until(() => f.relay.online.has(f.hostId));
   assert.equal((await f.json(f.base, '/api/remote-access/device/info', undefined, token)).status, 200);
-  assert.equal((await f.json(f.localUrl, '/api/remote-access/device/info', undefined, token, { 'X-Forwarded-For': 'synthetic-remote' })).status, 200);
+  assert.equal((await f.json(f.direct, '/api/remote-access/device/info', undefined, token)).status, 200);
 });

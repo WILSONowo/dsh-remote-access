@@ -13,5 +13,7 @@
 
 - **配对与会话安全**（`dsh-remote-access`）：`pair/*` 豁免面收敛、配对码一次性/限次/过期、
   `verify` 常量时间比较、通道 token 的 /api 全量 Bearer 门禁、公网域名白名单（trustedHosts）校验。
+- **端到端安全通道**：远程请求只在插件终结的 TLS 1.3 通道内被授权（内部标记 `SECURE_CHANNEL`，HTTP 头无法伪造）；
+  明文远程请求返回 426。重点关注：标记能否被伪造、`/api/remote-access/secure` 的资源上限、证书生成与指纹计算。
 - **远程访问边界**：仅向已配对设备签发 token；`pair/respond`、`pair/list`、`pair/revoke`、
   `pair/code/generate|current` 仅本机管理请求可达，手机设备 token 不授予管理权限。

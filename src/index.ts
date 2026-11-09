@@ -9,9 +9,10 @@
 // 移除：微信 iLink 桥（lib/ilink.js + lib/bridge.js）、cpolar 隧道供应（lib/cpolar.js），
 //       对应 wx/*、cpolar/*、/status、/start、/stop、/qr 路由与 qrcode 依赖一并删除。
 import { computerIdentity } from "./identity.js";
-import { createRelayManager } from "./relay.js";
+import { createGateway, createRelayManager } from "./relay.js";
+import { SECURE_PATH, createDirectSecureEndpoint, createSecureTerminator, loadSecureMaterial } from "./secure-channel.js";
 import { createModernAdapter } from "./modern.js";
-import { createSecurity, DEVICE_ID } from "./security.js";
+import { createSecurity, DEVICE_ID, requiresSecureChannel } from "./security.js";
 import { publishDiscovery } from "./discovery.js";
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -518,8 +519,17 @@ export const apply = (ctx) => {
   });
 
   let relay;
-  const security = createSecurity(home, reg, { publishDiscovery, onAccessChange: enabled => relay?.setAllowed(enabled) });
+  // Long-term TLS key whose SPKI pin phones verify; relay and direct share it (docs/e2e-secure-channel.md).
+  const secureMaterial = loadSecureMaterial(home);
+  const security = createSecurity(home, reg, { publishDiscovery, secure: secureMaterial, onAccessChange: enabled => relay?.setAllowed(enabled) });
   ctx.effect(() => () => security.dispose(), "dsh-remote-access: device credentials");
+  // Direct entry: WebSocket on the host port carrying the phone's TLS stream into a private gateway.
+  const directGateway = createGateway(webServer, false);
+  const directTerminator = createSecureTerminator(secureMaterial, directGateway.gateway);
+  const directEndpoint = createDirectSecureEndpoint(directTerminator);
+  const secureRoute = { kind: "upgrade", path: SECURE_PATH, handler: (req, socket, head) => directEndpoint.handleUpgrade(req, socket, head) };
+  disposers.push(typeof webServer.registerUpgrade === "function" ? webServer.registerUpgrade(secureRoute) : webServer.register(secureRoute));
+  ctx.effect(() => () => { directEndpoint.close(); directTerminator.close(); void directGateway.close(); }, "dsh-remote-access: direct secure channel");
 
   // ---------- 公网域名信任白名单（v2.4.0：写入 connection 行 !!js 拼接表达式） ----------
   // DSH ≥0.1.0-rc.7 的 /api Host 围栏读取 client-connection（行 id: connection）的 config.trustedHosts，
@@ -788,13 +798,17 @@ export const apply = (ctx) => {
     catch { return true; }
   };
 
-  const rejectHttp = (res, paused = false) => {
-    res.statusCode = paused ? 503 : 401;
+  // Plaintext remote access to plugin routes gets 426 so outdated phones can tell the user to upgrade.
+  const rejectHttp = (res, paused = false, req = undefined) => {
+    const upgrade = !paused && req && requiresSecureChannel(req);
+    res.statusCode = paused ? 503 : upgrade ? 426 : 401;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify(paused ? { error: "connections_disabled" } : { error: "unauthorized", hint: "channel token required" }));
+    res.end(JSON.stringify(paused ? { error: "connections_disabled" } : upgrade ? { error: "secure_channel_required" } : { error: "unauthorized", hint: "channel token required" }));
   };
-  const rejectUpgrade = (socket, paused = false) => {
-    socket.write(paused ? "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n" : "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+  const rejectUpgrade = (socket, paused = false, req = undefined) => {
+    const upgrade = !paused && req && requiresSecureChannel(req);
+    socket.write(paused ? "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"
+      : upgrade ? "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n" : "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
     socket.destroy();
   };
 
@@ -808,7 +822,7 @@ export const apply = (ctx) => {
     ...route,
     handler: (req, res) => {
       if (security.remoteBlocked(req)) return rejectHttp(res, true);
-      if (unauthorized(req)) return rejectHttp(res);
+      if (unauthorized(req)) return rejectHttp(res, false, req);
       security.track(req, res);
       return route.handler(req, res);
     },
@@ -817,7 +831,7 @@ export const apply = (ctx) => {
     ...route,
     handler: (req, socket, head) => {
       if (security.remoteBlocked(req)) return rejectUpgrade(socket, true);
-      if (unauthorized(req)) return rejectUpgrade(socket);
+      if (unauthorized(req)) return rejectUpgrade(socket, false, req);
       security.track(req, socket);
       return route.handler(req, socket, head);
     },
@@ -862,7 +876,7 @@ export const apply = (ctx) => {
   } else {
     throw new Error("Unsupported webServer route tables; remote access refused");
   }
-  relay = createRelayManager(home, webServer, reg, security.generatePairTicket, security.isEnabled);
+  relay = createRelayManager(home, webServer, reg, secureMaterial, security.generatePairTicket, security.isEnabled);
   // Modern desktop services are optional so legacy hosts retain their carrier.
   if (typeof ctx.inject === "function") ctx.inject(["typertGateway", "connection"], modernCtx => {
     const nativeCheck = req => modernCtx.connection.requestRejection(req);

@@ -200,6 +200,8 @@ window.__ModuleLoader__.load({
         h('div', {}, h('div', { className: 'remote-code' }, seconds > 0 ? pairing.code : '— — —'),
           muted(seconds > 0 ? t('expires', { time: time(seconds) }) : t('qrExpired'))),
         button(t('regenerate'), { disabled: busy, onClick: () => load('code') }));
+      // The phone shows the same code derived from the pinned key; a mismatch means someone is in between.
+      const safety = code => code && h('p', { className: 'remote-muted remote-safety-code' }, t('safetyCode', { code }));
       const choice = (key, icon, hint, target, disabled = false) => button(h(React.Fragment, {},
         h('div', { className: 'remote-choice-title' }, h(Icon, { name: icon }), h('strong', {}, t(key))), muted(t(hint))),
         { className: 'remote-choice', disabled, onClick: () => load(target) });
@@ -209,7 +211,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'remote-footer-row' },
             (mode === 'direct' || mode === 'server') && button(t(copied ? 'copied' : 'copyAddress'), {
               className: 'remote-footer-copy', disabled: busy || (mode === 'direct' ? !directQr || qrBusy : !pairing || seconds <= 0),
-              onClick: () => copy(mode === 'direct' ? directQr.link : pairing.link) }),
+              onClick: () => copy(mode === 'direct' ? directQr.address || directAddress : pairing.link) }),
             h('div', { className: 'remote-actions remote-footer-actions' }, mode && button(t('back'), { onClick: () => {
               generation.current++; qrGeneration.current++; stopDiscovery(); setMode(''); setPairing(null); setBusy(false); setError('');
             } }), button(t('close'), { onClick: onClose })))) },
@@ -222,22 +224,22 @@ window.__ModuleLoader__.load({
           busy && muted(t('loading')),
           mode === 'server' && !busy && (pairing && seconds > 0 ? h(React.Fragment, {}, muted(t('qrHint')),
             h('img', { className: 'remote-qr', src: pairing.image, alt: t('qrAlt') }),
-            h('div', { className: 'remote-qr-meta' }, muted(t('expires', { time: time(seconds) }))))
+            h('div', { className: 'remote-qr-meta' }, muted(t('expires', { time: time(seconds) }))), safety(pairing.safetyCode))
             : button(t('regenerate'), { onClick: () => load('server') })),
           mode === 'code' && !busy && h(React.Fragment, {}, muted(t('discoveryInstructions')),
             pairing && h('div', { className: 'remote-discovery-computer' }, h(Icon, { name: 'computer' }),
               h('strong', {}, pairing.name), muted(t('discoveryMarker', { id: pairing.session?.slice(-6) }))),
-            codeDisplay,
+            codeDisplay, pairing && safety(pairing.safetyCode),
             pairing && h('p', { className: 'remote-muted', role: 'status' }, t(pairing.discoveryFailed ? 'discoveryFailed' : 'discoveryActive')),
             !pairing && button(t('regenerate'), { onClick: () => load('code') })),
           mode === 'direct' && h(React.Fragment, {}, muted(t('directAddressHint')),
             h('label', { className: 'remote-address-label', htmlFor: 'dsh-direct-address' }, t('directUrl')),
             h(AddressPicker, { t, value: directAddress, addresses, disabled: busy,
               onChange: value => { if (value === directAddress) return; qrGeneration.current++; setDirectAddress(value); setDirectQr(null); setQrBusy(false); setCopied(false); },
-              onCommit: address => { if (address && directQr?.link !== address) void showDirectQr(address); } }),
+              onCommit: address => { if (address && directQr?.address !== address) void showDirectQr(address); } }),
             !addresses.length && !busy && muted(t('noAddress')),
             qrBusy && muted(t('generating')),
-            directQr && h('img', { className: 'remote-qr', src: directQr.image, alt: t('directQr') })),
+            directQr && h('img', { className: 'remote-qr', src: directQr.image, alt: t('directQr') }), directQr && safety(directQr.safetyCode)),
           failure(error && t(error))));
     }
     function DevicesSection({ t, access, updateAccess, accessBusy, server }) {

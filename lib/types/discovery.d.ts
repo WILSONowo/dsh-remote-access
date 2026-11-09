@@ -3,6 +3,7 @@ export type DiscoveryAdvertisement = {
     name: string;
     port: number;
     tls: boolean;
+    pin?: string;
 };
 export type DiscoveryPublisher = (value: DiscoveryAdvertisement, failed: () => void) => () => void;
 /** Open sockets only during an explicitly started pairing window. No credentials in TXT. */

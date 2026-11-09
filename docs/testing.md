@@ -20,6 +20,8 @@ npm test
 SDK 测试使用实际协议类和合成业务服务；后端联调仅使用本机临时服务器。环境变量指向无效目录时测试失败。
 发布前可同时启用两项，验证 HTTP、WebSocket、SSE、设备隔离、证书验证和断线重连。
 
+远程请求在测试中一律经过真实的端到端安全通道（`test/secure-client.mjs`：WebSocket → 固定指纹的 TLS 1.3 → HTTP），并断言明文令牌被拒绝（426/401）。修改二维码格式或证书生成后，重新生成 `test/fixtures/pairing-compact.json`，并同步到 App 仓库的 `app/src/test/resources/`（另需同步 `secure-channel-vector.json`）。
+
 实际部署或外部网络的测试必须单独显式配置目标和凭证，不能加入默认测试或提交真实数据。
 
 ## 插件设置页

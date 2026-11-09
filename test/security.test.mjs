@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createSecurity, RELAY_REQUEST, isLocalAdmin } from '../lib/security.js';
+import { createSecurity, RELAY_REQUEST, SECURE_CHANNEL, isLocalAdmin } from '../lib/security.js';
 import { validateRelayConfig } from '../lib/relay.js';
 
 test('未知/损坏凭证状态拒绝启动，不能降级为免鉴权', () => {
@@ -20,6 +20,8 @@ test('中转请求即使来自 localhost 且没有代理头，也不能成为管
   assert.equal(isLocalAdmin(request), true);
   request[RELAY_REQUEST] = true;
   assert.equal(isLocalAdmin(request), false);
+  const direct = { socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost' }, [SECURE_CHANNEL]: true };
+  assert.equal(isLocalAdmin(direct), false, 'secure-channel requests are phones, never local admins');
 });
 
 test('服务器地址校验阻止非 TLS 公网、URL 凭证、路径与主机 ID 注入', () => {
