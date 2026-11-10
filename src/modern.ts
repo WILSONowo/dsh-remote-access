@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { promisify } from 'node:util';
+import { gzip } from 'node:zlib';
 import { isAbsolute, join } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { DEVICE_ID, type Request, reply } from './security.js';
@@ -35,6 +37,22 @@ export function assistantBaseline(attempt: any) {
     else if (record.type === 'chunk' && record.chunk?.type === 'reasoning-delta') reasoning += record.chunk.text || '';
   }
   return { text, reasoning, startedAfterSeq: attempt?.startedAfterSeq ?? -1 };
+}
+const gzipAsync = promisify(gzip);
+/** Responses above this size are gzip-compressed when the phone accepts it (session.history can be megabytes). */
+export const COMPRESS_MIN_BYTES = 4096;
+/**
+ * JSON reply that compresses large bodies off the event loop (zlib runs on the thread pool).
+ * The phone's HTTP client sends Accept-Encoding: gzip and inflates transparently.
+ */
+export async function replyJson(req: IncomingMessage, res: ServerResponse, status: number, body: unknown) {
+  const text = Buffer.from(JSON.stringify(body));
+  const accepts = /(^|,)\s*gzip\s*(;|,|$)/i.test(String(req.headers['accept-encoding'] || ''));
+  if (!accepts || text.length < COMPRESS_MIN_BYTES) return reply(res, status, body);
+  const compressed = await gzipAsync(text);
+  if (res.destroyed) return;
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
+  res.end(compressed);
 }
 const errorOf = (e: any) => ({ code: e?.code || 'remote/error', message: e?.message || 'Host request failed' });
 async function readEnvelope(req: IncomingMessage) {
@@ -178,7 +196,7 @@ export function createModernAdapter(ctx: any, register: (route: any) => void) {
       if (['session.history', 'session.prompt'].includes(method)) want(req[DEVICE_ID]!, body.payload?.sessionId);
       const value = await translate(method, body.payload, rpcId, p, signal);
       if (method === 'session.create') want(req[DEVICE_ID]!, value.sessionId);
-      reply(res, 200, { type: 'server-response', rpcId, result: { ok: true, value: value ?? null } });
+      await replyJson(req, res, 200, { type: 'server-response', rpcId, result: { ok: true, value: value ?? null } });
     } catch (e) { if (!res.destroyed) reply(res, 200, { type: 'server-response', rpcId, result: { ok: false, error: errorOf(e) } }); }
     finally { res.removeListener('close', closed); control.abort(); await release(p); }
   }});
