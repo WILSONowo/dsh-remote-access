@@ -15,6 +15,10 @@ const RPCS = [
   'workspace.unarchiveSession', 'workspace.insertSessionBefore',
   'agentPreset.list', 'host.listDirectory',
 ];
+/** DSH release series this adapter has been verified against; keep in sync with protocol-contract.json. */
+export const VERIFIED_HOST_SERIES = ['0.2'];
+export const hostVerified = (version: string | undefined) =>
+  version === undefined ? null : VERIFIED_HOST_SERIES.some(series => version.startsWith(series + '.'));
 type Peer = { signal: AbortSignal; dispose(): Promise<void> };
 type Stream = {
   device: string; peer: Peer; control: AbortController;
@@ -182,7 +186,7 @@ export function createModernAdapter(ctx: any, register: (route: any) => void) {
     if (req.method !== 'POST') return reply(res, 405, { error: 'method_not_allowed' });
     try {
       const body = await readEnvelope(req);
-      reply(res, 200, { type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { protocol: 'dsh-remote-v3', hostProtocol: 'typert', pairingRequired: true, version: hostVersion } } });
+      reply(res, 200, { type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { protocol: 'dsh-remote-v3', hostProtocol: 'typert', pairingRequired: true, version: hostVersion, hostVerified: hostVerified(hostVersion) } } });
     } catch { reply(res, 400, { error: 'invalid_request' }); }
   }});
 
