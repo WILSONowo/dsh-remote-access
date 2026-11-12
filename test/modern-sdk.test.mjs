@@ -224,7 +224,7 @@ test('0.2.1-rc.5 actual WebServer/Connection: plugin mounting, native auth, rela
   assert.equal((await get('/api/session/list')).status, 401);
   assert.equal(await (await get('/api/session/list', 'fixture=browser')).text(), 'native browser');
   assert.equal(await (await get('/api/commands/list', 'fixture=browser')).text(), 'native browser');
-  assert.equal((await get('/api/remote-access/pair/code/current', 'fixture=browser')).status, 401);
+  assert.equal((await get('/api/remote-access/pair/code/current', 'fixture=browser')).status, 426);
   // Phones reach the host only through the pinned TLS channel on the host port.
   const direct = base.replace(/^http/, 'ws') + '/api/remote-access/secure';
   const describe = await secureRequest(direct, '/api/host.describe', { method: 'POST', body: { type: 'client-request', rpcId: 'describe', method: 'host.describe' } });
